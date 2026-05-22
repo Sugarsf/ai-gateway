@@ -17,7 +17,7 @@ from pydantic_settings import BaseSettings
 
 class AppConfig(BaseModel):
     name: str = "SpacemiT AI Gateway"
-    version: str = "0.1.5"
+    version: str = "0.1.7"
     host: str = "0.0.0.0"
     port: int = 18790
     debug: bool = False
@@ -63,7 +63,7 @@ class AsrConfig(BaseModel):
     backends: Optional[list[str]] = None
     model_dir: Optional[str] = None
     models: list[dict[str, Any]] = Field(default_factory=_default_asr_models)
-    language: str = "zh"
+    language: str = "auto"
     punctuation: bool = True
     provider: str = "spacemit"
     warmup_audio_ms: int = 1000
@@ -84,16 +84,20 @@ def _default_tts_models() -> list[dict[str, Any]]:
             "url": "https://archive.spacemit.com/spacemit-ai/model_zoo/tts/matcha-tts/"
             "matcha-icefall-zh-en.tar.gz",
             "archive_name": "matcha-icefall-zh-en.tar.gz",
-            "vocoder_name": "vocos-16khz-univ.onnx",
+            "vocoder_name": "vocos-16khz-univ.q.onnx",
             "vocoder_url": "https://archive.spacemit.com/spacemit-ai/model_zoo/tts/vocoder/"
-            "vocos-16khz-univ.onnx",
+            "vocos-16khz-univ.q.onnx",
         },
     ]
 
 
+def _default_tts_backends() -> list[str]:
+    return ["matcha_zh", "matcha_en", "matcha_zh_en", "kokoro"]
+
+
 class TtsConfig(BaseModel):
     backend: str = "matcha_zh_en"
-    backends: Optional[list[str]] = None
+    backends: Optional[list[str]] = Field(default_factory=_default_tts_backends)
     model_dir: Optional[str] = None
     models: list[dict[str, Any]] = Field(default_factory=_default_tts_models)
     speed: float = 1.0
