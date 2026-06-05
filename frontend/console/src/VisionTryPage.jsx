@@ -32,6 +32,176 @@ const CAP_LABEL = {
   track:'目标跟踪',
 };
 
+function detectionList(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (Array.isArray(value.items)) return value.items;
+  if (Array.isArray(value.results)) return value.results;
+  if (Array.isArray(value.data)) return value.data;
+  if (Array.isArray(value.detections)) return value.detections;
+  if (Array.isArray(value.boxes)) return value.boxes;
+  return [];
+}
+
+function pickDetections(results) {
+  const candidates = [
+    results,
+    results?.detect,
+    results?.detections,
+    results?.det,
+    results?.boxes,
+    results?.objects,
+    results?.results?.detect,
+    results?.results?.detections,
+    results?.data?.results?.detect,
+    results?.data?.results?.detections,
+  ];
+  for (const candidate of candidates) {
+    const list = detectionList(candidate);
+    if (list.length > 0) return list;
+  }
+  return [];
+}
+
+function toFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function readBoxObject(box, normalized) {
+  if (!box || typeof box !== 'object') return { bbox: [], normalized };
+  const x1 = box.x1 ?? box.left ?? box.xmin ?? box.x;
+  const y1 = box.y1 ?? box.top ?? box.ymin ?? box.y;
+  let x2 = box.x2 ?? box.right ?? box.xmax;
+  let y2 = box.y2 ?? box.bottom ?? box.ymax;
+  const w = box.w ?? box.width;
+  const h = box.h ?? box.height;
+  if ((x2 == null || y2 == null) && w != null && h != null && x1 != null && y1 != null) {
+    x2 = Number(x1) + Number(w);
+    y2 = Number(y1) + Number(h);
+  }
+  return { bbox: [x1, y1, x2, y2], normalized };
+}
+
+function xywhToBBox(values, normalized) {
+  if (!Array.isArray(values) || values.length < 4) return { bbox: [], normalized };
+  const [x, y, w, h] = values.slice(0, 4).map(toFiniteNumber);
+  if ([x, y, w, h].some(v => v == null)) return { bbox: [], normalized };
+  return { bbox: [x, y, x + w, y + h], normalized };
+}
+
+function readXYWHObject(box, normalized) {
+  if (!box || typeof box !== 'object') return { bbox: [], normalized };
+  const x = toFiniteNumber(box.x ?? box.x1 ?? box.left ?? box.xmin);
+  const y = toFiniteNumber(box.y ?? box.y1 ?? box.top ?? box.ymin);
+  const w = toFiniteNumber(box.w ?? box.width);
+  const h = toFiniteNumber(box.h ?? box.height);
+  if ([x, y, w, h].some(v => v == null)) return { bbox: [], normalized };
+  return { bbox: [x, y, x + w, y + h], normalized };
+}
+
+function hasNormalizedBoxFormat(format) {
+  const text = String(format || '').toLowerCase();
+  return text.includes('norm') || text.includes('relative') || text.includes('ratio') ||
+    text.includes('xyxyn') || text.includes('xywhn');
+}
+
+function hasExplicitNormalizedBox(item, raw) {
+  const d = item || {};
+  return d.normalized === true || d.is_normalized === true || d.relative === true ||
+    raw?.normalized === true || raw?.is_normalized === true || raw?.relative === true ||
+    d.xyxyn != null || d.xywhn != null || d.bbox_xyxyn != null || d.bbox_xywhn != null ||
+    hasNormalizedBoxFormat(d.bbox_format ?? d.box_format ?? d.format ?? raw?.bbox_format ?? raw?.box_format ?? raw?.format);
+}
+
+function normalizeBBox(item) {
+  const d = item || {};
+  const xywh = d.xywh ?? d.bbox_xywh ?? d.xywhn ?? d.bbox_xywhn;
+  const xywhNormalized = hasExplicitNormalizedBox(d, xywh);
+  if (Array.isArray(xywh)) {
+    return xywhToBBox(xywh, xywhNormalized);
+  }
+  if (xywh && typeof xywh === 'object') {
+    return readXYWHObject(xywh, xywhNormalized);
+  }
+
+  let raw = Array.isArray(d) ? d : (d.bbox ?? d.box ?? d.xyxy ?? d.xyxyn ?? d.bbox_xyxyn ?? d.rect ?? d.bounds);
+  const normalized = hasExplicitNormalizedBox(d, raw);
+  const boxFormat = String(d.bbox_format ?? d.box_format ?? d.format ?? raw?.bbox_format ?? raw?.box_format ?? raw?.format ?? '').toLowerCase();
+  if (boxFormat.includes('xywh') && raw != null) {
+    if (Array.isArray(raw)) return xywhToBBox(raw, normalized);
+    if (typeof raw === 'object') return readXYWHObject(raw, normalized);
+  }
+
+  let box = [];
+  if (Array.isArray(raw)) {
+    box = raw.slice(0, 4);
+  } else if (raw && typeof raw === 'object') {
+    box = readBoxObject(raw, normalized).bbox;
+  } else {
+    box = [
+      d.x1 ?? d.left ?? d.xmin ?? d.x,
+      d.y1 ?? d.top ?? d.ymin ?? d.y,
+      d.x2 ?? d.right ?? d.xmax,
+      d.y2 ?? d.bottom ?? d.ymax,
+    ];
+  }
+
+  let [x1, y1, x2, y2] = box.map(toFiniteNumber);
+  const w = toFiniteNumber(d.w ?? d.width ?? raw?.w ?? raw?.width);
+  const h = toFiniteNumber(d.h ?? d.height ?? raw?.h ?? raw?.height);
+  if ((x2 == null || y2 == null) && x1 != null && y1 != null && w != null && h != null) {
+    x2 = x1 + w;
+    y2 = y1 + h;
+  } else if (x1 != null && y1 != null && x2 != null && y2 != null && (x2 < x1 || y2 < y1)) {
+    return { bbox: [], normalized };
+  }
+
+  return { bbox: [x1, y1, x2, y2], normalized };
+}
+
+function normalizeDetection(item) {
+  const d = item || {};
+  const { bbox, normalized } = normalizeBBox(d);
+  if (bbox.length !== 4 || bbox.some(v => !Number.isFinite(v))) return null;
+
+  const rawScore = Array.isArray(d)
+    ? toFiniteNumber(d[4])
+    : toFiniteNumber(d.score ?? d.confidence ?? d.conf ?? d.prob);
+  const score = rawScore == null ? 1 : (rawScore > 1 && rawScore <= 100 ? rawScore / 100 : rawScore);
+  const label = Array.isArray(d)
+    ? (d[5] ?? 'object')
+    : (d.label_name ?? d.class_name ?? d.name ?? d.label ?? d.class_id ?? d.class_idx ?? 'object');
+  const rawTrackId = d.track_id ?? d.trackId ?? d.id ?? -1;
+  const trackId = Number(rawTrackId);
+
+  return {
+    label: String(label),
+    score,
+    bbox,
+    bboxNormalized: normalized,
+    x1: bbox[0],
+    y1: bbox[1],
+    x2: bbox[2],
+    y2: bbox[3],
+    track_id: Number.isFinite(trackId) ? trackId : -1,
+  };
+}
+
+function renderBoxForSize(detection, sourceSize, renderedSize) {
+  const bbox = detection?.bbox || [];
+  const [x1, y1, x2, y2] = bbox.map(Number);
+  if (![x1, y1, x2, y2].every(Number.isFinite)) return null;
+  if (!renderedSize?.w || !renderedSize?.h) return null;
+  if (detection.bboxNormalized) {
+    return [x1 * renderedSize.w, y1 * renderedSize.h, x2 * renderedSize.w, y2 * renderedSize.h];
+  }
+  if (!sourceSize?.w || !sourceSize?.h) return null;
+  const sx = renderedSize.w / sourceSize.w;
+  const sy = renderedSize.h / sourceSize.h;
+  return [x1 * sx, y1 * sy, x2 * sx, y2 * sy];
+}
+
 function VisionTryPage({ model, onBack: _onBack }) {
   const { Icon, visionApi, t } = window;
   const caps = model.capabilities || [];
@@ -48,7 +218,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
   const [imgFile, setImgFile] = useStateV(null);
   const [imgUrlB, setImgUrlB] = useStateV(null);
   const [imgFileB, setImgFileB] = useStateV(null);
-  const [imgSize, setImgSize] = useStateV({ w: 1, h: 1, renderedW: 1, renderedH: 1 });
+  const [imgSize, setImgSize] = useStateV({ w: 0, h: 0, renderedW: 0, renderedH: 0 });
   const [loading, setLoading] = useStateV(false);
   const [error, setError] = useStateV('');
   const [loadError, setLoadError] = useStateV('');
@@ -203,7 +373,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
           if (msg.event === 'ready') {
             startSendLoop(ws, video);
           } else if (msg.event === 'frame_result') {
-            setStreamDetections(msg.detections || []);
+            setStreamDetections(detectionList(msg.detections).map(normalizeDetection).filter(Boolean));
             setStreamPose(msg.pose || null);
             setStreamEmotion(msg.emotion || null);
             setStreamClassify(msg.classify || null);
@@ -262,6 +432,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
   const onFile = (e) => {
     const f = e.target.files[0]; if (!f) return;
     setImgFile(f); setImgUrl(URL.createObjectURL(f));
+    setImgSize({ w: 0, h: 0, renderedW: 0, renderedH: 0 });
     setResults(null); setSimilarity(null); setTiming(null); setError('');
   };
   const onFileB = (e) => {
@@ -308,9 +479,10 @@ function VisionTryPage({ model, onBack: _onBack }) {
           opts.iou = iou;
         }
         const res = await visionApi.inference(imgFile, tasks, model.id, opts);
-        setResults(res.results || res);
+        const resultPayload = res.results || res;
+        setResults(resultPayload);
         setTiming(res.timing || null);
-        const dets = res.results?.detect || res.detect || [];
+        const dets = pickDetections(resultPayload).map(normalizeDetection).filter(Boolean);
         window.historyStore?.push({
           model: model.id, type: 'Vision',
           input: imgFile.name || 'image',
@@ -324,15 +496,12 @@ function VisionTryPage({ model, onBack: _onBack }) {
     setLoading(false);
   };
 
-  const detections = (results?.detect || []).map(d => ({
-    label: d.label_name || d.label != null ? (d.label_name || String(d.label)) : 'object',
-    score: d.score, bbox: d.bbox || [d.x1, d.y1, d.x2, d.y2],
-    track_id: d.track_id,
-  }));
+  const detections = pickDetections(results).map(normalizeDetection).filter(Boolean);
   const poses = results?.pose || [];
   const segments = results?.segment || [];
   const classifications = results?.classify || [];
   const emotions = results?.emotion || [];
+  const imageScaleReady = imgSize.w > 0 && imgSize.h > 0 && imgSize.renderedW > 0 && imgSize.renderedH > 0;
 
   const btnLabel = isArcface
     ? (loading ? t('推理中…') : !modelReady ? t('模型加载中…') : t('计算相似度'))
@@ -382,18 +551,23 @@ function VisionTryPage({ model, onBack: _onBack }) {
                 {camActive && (hasDetect || hasTrack) && streamDetections.filter(d => (d.score ?? 1) >= threshold).map((d, i) => {
                   const video = videoRef.current;
                   if (!video || !video.videoWidth) return null;
-                  const sx = video.clientWidth / video.videoWidth;
-                  const sy = video.clientHeight / video.videoHeight;
+                  const box = renderBoxForSize(
+                    d,
+                    { w: video.videoWidth, h: video.videoHeight },
+                    { w: video.clientWidth, h: video.clientHeight },
+                  );
+                  if (!box) return null;
+                  const [x1, y1, x2, y2] = box;
                   const ci = hasTrack && d.track_id >= 0 ? d.track_id : i;
                   const c = DET_COLORS[ci % DET_COLORS.length];
-                  const labelText = d.label_name || d.label;
+                  const labelText = d.label || 'object';
                   const lbl = hasTrack && d.track_id >= 0
                     ? `#${d.track_id} ${labelText} ${((d.score ?? 1) * 100).toFixed(0)}%`
                     : `${labelText} ${((d.score ?? 1) * 100).toFixed(0)}%`;
                   return (
                     <div key={'det-'+i} style={{
-                      position: 'absolute', left: d.x1 * sx, top: d.y1 * sy,
-                      width: (d.x2 - d.x1) * sx, height: (d.y2 - d.y1) * sy,
+                      position: 'absolute', left: x1, top: y1,
+                      width: x2 - x1, height: y2 - y1,
                       border: `2px solid ${c}`, boxShadow: '0 0 0 1px rgba(0,0,0,0.3)',
                       pointerEvents: 'none',
                     }}>
@@ -438,12 +612,15 @@ function VisionTryPage({ model, onBack: _onBack }) {
                 {camActive && hasEmotion && streamEmotion && (() => {
                   const video = videoRef.current;
                   if (!video || !video.videoWidth) return null;
-                  const sx = video.clientWidth / video.videoWidth;
-                  const sy = video.clientHeight / video.videoHeight;
                   return streamEmotion.map((em, ei) => {
                     const det = streamDetections[ei];
-                    const x = det ? det.x1 * sx : 10;
-                    const y = det ? det.y2 * sy + 4 : 30 + ei * 28;
+                    const box = det ? renderBoxForSize(
+                      det,
+                      { w: video.videoWidth, h: video.videoHeight },
+                      { w: video.clientWidth, h: video.clientHeight },
+                    ) : null;
+                    const x = box ? box[0] : 10;
+                    const y = box ? box[3] + 4 : 30 + ei * 28;
                     const c = EMOTION_COLORS[em.label] || '#8a8e95';
                     return (
                       <div key={'emo-'+ei} style={{
@@ -554,10 +731,14 @@ function VisionTryPage({ model, onBack: _onBack }) {
                     style={{ maxWidth: '100%', maxHeight: 560, display: 'block', borderRadius: 6 }}/>
 
                   {/* Detection overlay */}
-                  {hasDetect && detections.filter(d => (d.score ?? 1) >= threshold).map((d, i) => {
-                    const [x1, y1, x2, y2] = d.bbox;
-                    const sx = imgSize.renderedW / imgSize.w;
-                    const sy = imgSize.renderedH / imgSize.h;
+                  {hasDetect && imageScaleReady && detections.filter(d => (d.score ?? 1) >= threshold).map((d, i) => {
+                    const box = renderBoxForSize(
+                      d,
+                      { w: imgSize.w, h: imgSize.h },
+                      { w: imgSize.renderedW, h: imgSize.renderedH },
+                    );
+                    if (!box) return null;
+                    const [x1, y1, x2, y2] = box;
                     const ci = hasTrack && d.track_id >= 0 ? d.track_id : i;
                     const c = DET_COLORS[ci % DET_COLORS.length];
                     const lbl = hasTrack && d.track_id >= 0
@@ -565,8 +746,8 @@ function VisionTryPage({ model, onBack: _onBack }) {
                       : `${d.label} ${((d.score ?? 1) * 100).toFixed(0)}%`;
                     return (
                       <div key={i} style={{
-                        position: 'absolute', left: x1 * sx, top: y1 * sy,
-                        width: (x2 - x1) * sx, height: (y2 - y1) * sy,
+                        position: 'absolute', left: x1, top: y1,
+                        width: x2 - x1, height: y2 - y1,
                         border: `2px solid ${c}`, boxShadow: '0 0 0 1px rgba(0,0,0,0.3)',
                         pointerEvents: 'none',
                       }}>
@@ -581,7 +762,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
                   })}
 
                   {/* Pose overlay */}
-                  {hasPose && poses.length > 0 && (
+                  {hasPose && imageScaleReady && poses.length > 0 && (
                     <svg style={{
                       position: 'absolute', top: 0, left: 0,
                       width: imgSize.renderedW, height: imgSize.renderedH,
@@ -614,7 +795,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
                   )}
 
                   {/* Segment overlay */}
-                  {hasSegment && segments.length > 0 && (
+                  {hasSegment && imageScaleReady && segments.length > 0 && (
                     <svg style={{
                       position: 'absolute', top: 0, left: 0,
                       width: imgSize.renderedW, height: imgSize.renderedH,
@@ -872,7 +1053,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
               color: 'var(--text-dim)', border: '1px solid var(--border)',
             }}>
               {mode === 'camera' ? (
-                <>WS {visionApi.streamUrl().replace(/^ws/, 'ws')}<br/>&nbsp;&nbsp;model_id={model.id}</>
+                <>WS {visionApi.streamUrl().replace(/^ws/, 'ws')}<br/>&nbsp;&nbsp;model_id={backendModelId}</>
               ) : (
                 <>POST {apiEndpoint}<br/>
                 {isArcface
