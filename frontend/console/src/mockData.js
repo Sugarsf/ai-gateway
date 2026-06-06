@@ -266,6 +266,20 @@ function visionCatalogMeta(id) {
   return catalog.find(m => m.id === canonical) || null;
 }
 
+function cleanVisionMetaRows(metaRows) {
+  const seen = new Set();
+  return (metaRows || []).filter(row => {
+    if (!Array.isArray(row)) return false;
+    const key = String(row[0] ?? '').trim();
+    if (!key) return false;
+    const normalizedKey = key.toLowerCase();
+    if (key === '后端' || normalizedKey === 'backend') return false;
+    if (seen.has(normalizedKey)) return false;
+    seen.add(normalizedKey);
+    return true;
+  });
+}
+
 const VLM_MODEL_META_ALIASES = {
   'qwen2.5-vl-3b': {
     id: 'qwen2.5-vl-3b', name: 'Qwen2.5-VL-3B', icon: 'image', domain: 'vlm',
@@ -388,9 +402,10 @@ window.initModelCatalog = async function() {
         capabilities: caps,
         desc: meta?.desc || (domain === 'vlm' ? '视觉语言模型' : buildVisionDesc(caps)),
         meta: [
-          ...(meta?.meta || [['类型', domain === 'vlm' ? '视觉语言' : buildVisionDesc(caps)]]),
+          ...cleanVisionMetaRows(meta?.meta || [['类型', domain === 'vlm' ? '视觉语言' : buildVisionDesc(caps)]]),
           ['后端', m.backend || '-'],
         ],
+        rawStatus: m.status,
         status: domain === 'vlm' ? vlmDisplayStatus(m.status) : (m.status === 'ready' ? 'ready' : 'idle'),
         calls: 0, latencyMs: 0,
       };
@@ -417,6 +432,7 @@ window.initModelCatalog = async function() {
         capabilities: ['vlm'],
         desc: meta?.desc || ((m.source_type === 'remote' ? 'Remote · ' : 'VLM · ') + source),
         meta: [['类型', '视觉语言'], ['来源', m.source_type || '-'], ['状态', displayStatus]],
+        rawStatus: m.status,
         status: displayStatus, calls: 0, latencyMs: 0,
       };
     }).filter(Boolean);
@@ -454,6 +470,7 @@ window.initModelCatalog = async function() {
         ...(isTrans ? { task: 'translate' } : {}),
         desc: isTrans ? '火山翻译模型，支持中英双向翻译' : (m.source_type === 'remote' ? 'Remote · ' : 'Local · ') + (m.url || m.local_path || 'GGUF'),
         meta: [['来源', m.source_type || '-'], ['状态', m.status || '-']],
+        rawStatus: m.status,
         status: statusMap[m.status] || 'idle', calls: 0, latencyMs: 0,
       };
     });

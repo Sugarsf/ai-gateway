@@ -193,13 +193,38 @@ function renderBoxForSize(detection, sourceSize, renderedSize) {
   const [x1, y1, x2, y2] = bbox.map(Number);
   if (![x1, y1, x2, y2].every(Number.isFinite)) return null;
   if (!renderedSize?.w || !renderedSize?.h) return null;
+  const ox = renderedSize.offsetX || 0;
+  const oy = renderedSize.offsetY || 0;
   if (detection.bboxNormalized) {
-    return [x1 * renderedSize.w, y1 * renderedSize.h, x2 * renderedSize.w, y2 * renderedSize.h];
+    return [
+      ox + x1 * renderedSize.w,
+      oy + y1 * renderedSize.h,
+      ox + x2 * renderedSize.w,
+      oy + y2 * renderedSize.h,
+    ];
   }
   if (!sourceSize?.w || !sourceSize?.h) return null;
   const sx = renderedSize.w / sourceSize.w;
   const sy = renderedSize.h / sourceSize.h;
-  return [x1 * sx, y1 * sy, x2 * sx, y2 * sy];
+  return [ox + x1 * sx, oy + y1 * sy, ox + x2 * sx, oy + y2 * sy];
+}
+
+function containRenderedSize(sourceW, sourceH, boxW, boxH) {
+  if (!sourceW || !sourceH || !boxW || !boxH) return null;
+  const scale = Math.min(boxW / sourceW, boxH / sourceH);
+  const w = sourceW * scale;
+  const h = sourceH * scale;
+  return {
+    w,
+    h,
+    offsetX: (boxW - w) / 2,
+    offsetY: (boxH - h) / 2,
+  };
+}
+
+function videoRenderedSize(video) {
+  if (!video || !video.videoWidth || !video.videoHeight) return null;
+  return containRenderedSize(video.videoWidth, video.videoHeight, video.clientWidth, video.clientHeight);
 }
 
 function VisionTryPage({ model, onBack: _onBack }) {
@@ -229,6 +254,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
   const [similarity, setSimilarity] = useStateV(null);
   const [timing, setTiming] = useStateV(null);
   const imgRef = useRefV(null);
+  const imageInputRef = useRefV(null);
 
   // Camera mode state
   const [mode, setMode] = useStateV('image');
@@ -269,6 +295,12 @@ function VisionTryPage({ model, onBack: _onBack }) {
     };
 
     const loadCurrentModel = async () => {
+      if (model.status === 'ready') {
+        await visionApi.switchModel(backendModelId).catch(() => {});
+        setLoadError('');
+        setModelReady(true);
+        return;
+      }
       setLoadError(t('模型加载中…'));
       // 先卸载其他已加载的模型，释放 AI cores
       await unloadOthers();
@@ -434,6 +466,8 @@ function VisionTryPage({ model, onBack: _onBack }) {
     setImgFile(f); setImgUrl(URL.createObjectURL(f));
     setImgSize({ w: 0, h: 0, renderedW: 0, renderedH: 0 });
     setResults(null); setSimilarity(null); setTiming(null); setError('');
+    if (!isArcface) runInference(f);
+    e.target.value = '';
   };
   const onFileB = (e) => {
     const f = e.target.files[0]; if (!f) return;
@@ -441,32 +475,64 @@ function VisionTryPage({ model, onBack: _onBack }) {
     setSimilarity(null); setTiming(null); setError('');
   };
   const onImgLoad = (e) => {
-    const el = e.target;
-    setImgSize({ w: el.naturalWidth, h: el.naturalHeight, renderedW: el.clientWidth, renderedH: el.clientHeight });
+    updateImageMetrics(e.target);
   };
 
-  const runInference = async () => {
-    if (!imgFile) return;
+  const updateImageMetrics = (el = imgRef.current) => {
+    if (!el) return;
+    const wrap = el.parentElement;
+    const imgRect = el.getBoundingClientRect();
+    const wrapRect = wrap?.getBoundingClientRect();
+    setImgSize({
+      w: el.naturalWidth,
+      h: el.naturalHeight,
+      renderedW: imgRect.width,
+      renderedH: imgRect.height,
+      offsetX: wrapRect ? imgRect.left - wrapRect.left : 0,
+      offsetY: wrapRect ? imgRect.top - wrapRect.top : 0,
+    });
+  };
+
+  useEffectV(() => {
+    if (!imgUrl || !imgRef.current) return undefined;
+    updateImageMetrics();
+    if (!window.ResizeObserver) {
+      const onResize = () => updateImageMetrics();
+      window.addEventListener('resize', onResize);
+      return () => window.removeEventListener('resize', onResize);
+    }
+    const observer = new ResizeObserver(() => updateImageMetrics());
+    observer.observe(imgRef.current);
+    if (imgRef.current.parentElement) observer.observe(imgRef.current.parentElement);
+    return () => observer.disconnect();
+  }, [imgUrl]);
+
+  const runInference = async (file = imgFile) => {
+    if (!file) return;
+    if (!modelReady) {
+      setError(loadError || t('模型加载中…'));
+      return;
+    }
     setLoading(true); setError('');
     const _t0 = Date.now();
     try {
       if (isArcface) {
         if (imgFileB) {
-          const res = await visionApi.feature(imgFile, 'similarity', model.id, imgFileB);
+          const res = await visionApi.feature(file, 'similarity', model.id, imgFileB);
           setSimilarity(res.similarity);
           setTiming(res.timing || null);
           window.historyStore?.push({
             model: model.id, type: 'Vision',
-            input: imgFile.name || 'image',
+            input: file.name || 'image',
             output: t('相似度') + ': ' + (res.similarity * 100).toFixed(1) + '%',
             latency: Date.now() - _t0,
           });
         } else {
-          const res = await visionApi.feature(imgFile, 'embedding', model.id);
+          const res = await visionApi.feature(file, 'embedding', model.id);
           setTiming(res.timing || null);
           window.historyStore?.push({
             model: model.id, type: 'Vision',
-            input: imgFile.name || 'image',
+            input: file.name || 'image',
             output: t('特征提取'),
             latency: Date.now() - _t0,
           });
@@ -478,14 +544,14 @@ function VisionTryPage({ model, onBack: _onBack }) {
           opts.conf = threshold;
           opts.iou = iou;
         }
-        const res = await visionApi.inference(imgFile, tasks, model.id, opts);
+        const res = await visionApi.inference(file, tasks, model.id, opts);
         const resultPayload = res.results || res;
         setResults(resultPayload);
         setTiming(res.timing || null);
         const dets = pickDetections(resultPayload).map(normalizeDetection).filter(Boolean);
         window.historyStore?.push({
           model: model.id, type: 'Vision',
-          input: imgFile.name || 'image',
+          input: file.name || 'image',
           output: dets.length + ' ' + t('个目标') + ' · ' + tasks.join('+'),
           latency: Date.now() - _t0,
         });
@@ -508,16 +574,15 @@ function VisionTryPage({ model, onBack: _onBack }) {
     : (loading ? t('推理中…') : !modelReady ? t('模型加载中…') : t('开始推理'));
 
   const renderImageUpload = () => (
-    <label style={{ textAlign: 'center', cursor: 'pointer', color: 'var(--text-dim)' }}>
-      <input type="file" accept="image/*" onChange={onFile} style={{ display: 'none' }}/>
+    <div style={{ textAlign: 'center', color: 'var(--text-dim)' }}>
       <div style={{ fontSize: 48, color: 'var(--text-low)' }}>{Icon.upload({ size: 48, strokeWidth: 1 })}</div>
-      <div style={{ marginTop: 12, fontSize: 13 }}>{t('点击上传图片或拖拽至此')}</div>
+      <div style={{ marginTop: 12, fontSize: 13 }}>{t('点击上传图片')}</div>
       <div className="text-xs text-mono mt-2" style={{ color: 'var(--text-low)' }}>JPG / PNG / WebP</div>
-    </label>
+    </div>
   );
 
   return (
-    <div className="main-inner">
+    <div className="main-inner try-page vision-try-page">
       <div className="back-link" onClick={handleBack}>
         {Icon.arrowLeft({ size: 14 })}<span>{t('返回模型选择')}</span>
       </div>
@@ -554,7 +619,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
                   const box = renderBoxForSize(
                     d,
                     { w: video.videoWidth, h: video.videoHeight },
-                    { w: video.clientWidth, h: video.clientHeight },
+                    videoRenderedSize(video),
                   );
                   if (!box) return null;
                   const [x1, y1, x2, y2] = box;
@@ -584,10 +649,19 @@ function VisionTryPage({ model, onBack: _onBack }) {
                 {camActive && hasPose && streamPose && (() => {
                   const video = videoRef.current;
                   if (!video || !video.videoWidth) return null;
-                  const sx = video.clientWidth / video.videoWidth;
-                  const sy = video.clientHeight / video.videoHeight;
+                  const display = videoRenderedSize(video);
+                  if (!display) return null;
+                  const sx = display.w / video.videoWidth;
+                  const sy = display.h / video.videoHeight;
                   return (
-                    <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
+                    <svg style={{
+                      position: 'absolute',
+                      left: display.offsetX,
+                      top: display.offsetY,
+                      width: display.w,
+                      height: display.h,
+                      pointerEvents: 'none',
+                    }}>
                       {streamPose.map((p, pi) => {
                         const kps = p.keypoints || [];
                         return (
@@ -617,7 +691,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
                     const box = det ? renderBoxForSize(
                       det,
                       { w: video.videoWidth, h: video.videoHeight },
-                      { w: video.clientWidth, h: video.clientHeight },
+                      videoRenderedSize(video),
                     ) : null;
                     const x = box ? box[0] : 10;
                     const y = box ? box[3] + 4 : 30 + ei * 28;
@@ -719,23 +793,52 @@ function VisionTryPage({ model, onBack: _onBack }) {
               </div>
             </div>
           ) : (
-            <div style={{
-              background: 'var(--bg-1)', border: '1px dashed var(--border-2)',
-              borderRadius: 10, padding: 16, minHeight: 420,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              position: 'relative', overflow: 'hidden',
-            }}>
+            <div
+              className="vision-media-stage"
+              role="button"
+              tabIndex={0}
+              onClick={() => { if (!loading) imageInputRef.current?.click(); }}
+              onKeyDown={e => {
+                if (!loading && (e.key === 'Enter' || e.key === ' ')) {
+                  e.preventDefault();
+                  imageInputRef.current?.click();
+                }
+              }}
+              style={{ cursor: loading ? 'progress' : 'pointer' }}
+            >
+              <input
+                ref={imageInputRef}
+                type="file"
+                accept="image/*"
+                onClick={e => e.stopPropagation()}
+                onChange={onFile}
+                style={{ display: 'none' }}
+              />
+              {loading && (
+                <div style={{
+                  position: 'absolute', top: 12, right: 12, zIndex: 3,
+                  background: 'rgba(0,0,0,0.72)', border: '1px solid var(--border)',
+                  borderRadius: 6, padding: '5px 10px',
+                  color: 'var(--accent)', fontSize: 12, fontFamily: 'var(--font-mono)',
+                  pointerEvents: 'none',
+                }}>{t('推理中…')}</div>
+              )}
               {!imgUrl ? renderImageUpload() : (
-                <div style={{ position: 'relative', display: 'inline-block' }}>
+                <div className="vision-media-wrap">
                   <img ref={imgRef} src={imgUrl} onLoad={onImgLoad}
-                    style={{ maxWidth: '100%', maxHeight: 560, display: 'block', borderRadius: 6 }}/>
+                    style={{ display: 'block', borderRadius: 6 }}/>
 
                   {/* Detection overlay */}
                   {hasDetect && imageScaleReady && detections.filter(d => (d.score ?? 1) >= threshold).map((d, i) => {
                     const box = renderBoxForSize(
                       d,
                       { w: imgSize.w, h: imgSize.h },
-                      { w: imgSize.renderedW, h: imgSize.renderedH },
+                      {
+                        w: imgSize.renderedW,
+                        h: imgSize.renderedH,
+                        offsetX: imgSize.offsetX || 0,
+                        offsetY: imgSize.offsetY || 0,
+                      },
                     );
                     if (!box) return null;
                     const [x1, y1, x2, y2] = box;
@@ -764,7 +867,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
                   {/* Pose overlay */}
                   {hasPose && imageScaleReady && poses.length > 0 && (
                     <svg style={{
-                      position: 'absolute', top: 0, left: 0,
+                      position: 'absolute', top: imgSize.offsetY || 0, left: imgSize.offsetX || 0,
                       width: imgSize.renderedW, height: imgSize.renderedH,
                       pointerEvents: 'none',
                     }}>
@@ -797,7 +900,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
                   {/* Segment overlay */}
                   {hasSegment && imageScaleReady && segments.length > 0 && (
                     <svg style={{
-                      position: 'absolute', top: 0, left: 0,
+                      position: 'absolute', top: imgSize.offsetY || 0, left: imgSize.offsetX || 0,
                       width: imgSize.renderedW, height: imgSize.renderedH,
                       pointerEvents: 'none',
                     }}>
@@ -824,7 +927,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
                   {/* Classify overlay on image */}
                   {hasClassify && !hasEmotion && classifications.length > 0 && (
                     <div style={{
-                      position: 'absolute', top: 12, left: 12,
+                      position: 'absolute', top: (imgSize.offsetY || 0) + 12, left: (imgSize.offsetX || 0) + 12,
                       background: 'rgba(0,0,0,0.75)', borderRadius: 8, padding: '8px 12px',
                       pointerEvents: 'none', maxWidth: '60%',
                     }}>
@@ -847,7 +950,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
                   {/* Emotion overlay on image */}
                   {hasEmotion && emotions.length > 0 && (
                     <div style={{
-                      position: 'absolute', top: 12, left: 12,
+                      position: 'absolute', top: (imgSize.offsetY || 0) + 12, left: (imgSize.offsetX || 0) + 12,
                       background: 'rgba(0,0,0,0.75)', borderRadius: 8, padding: '8px 12px',
                       pointerEvents: 'none', maxWidth: '60%',
                     }}>
@@ -874,7 +977,7 @@ function VisionTryPage({ model, onBack: _onBack }) {
 
           {/* Action buttons */}
           <div className="flex gap-3 mt-4">
-            {(imgUrl || (isArcface && imgUrl)) && (
+            {isArcface && imgUrl && (
               <>
                 <button className="btn-primary" disabled={loading || !modelReady} onClick={runInference}>
                   {btnLabel}
